@@ -1,7 +1,5 @@
-# app.py – FastAPI (MOCK/ONNX) – emocje do Unity
-# Wewnętrznie model FER+ (8 klas):
 # neutral, happiness, surprise, sadness, anger, disgust, fear, contempt
-# Do Unity wysyłamy: neutral, boredom, happiness, surprise, anger, fear (+ opcjonalnie sadness jeśli chcesz)
+# Do Unity: neutral, boredom, happiness, surprise, anger, fear
 
 import asyncio, os, time, json, sqlite3, threading, math
 from typing import Dict, Optional, List
@@ -17,19 +15,17 @@ FPS_TARGET  = int(os.environ.get("FER_FPS", "10"))
 MODEL_PATH  = os.path.join("models", os.environ.get("FER_MODEL", "ferplus.onnx"))
 FER_MODE    = os.environ.get("FER_MODE", "auto")          # auto | mock | onnx
 
-CONF_THRESH = float(os.environ.get("FER_CONF_THRESH", "0.30"))  # 0.25–0.35
-BUF_LEN     = int(os.environ.get("FER_BUFFER", "20"))           # 10–30
-MIN_FACE    = int(os.environ.get("FER_MIN_FACE", "100"))        # px
-PAD_RATIO   = float(os.environ.get("FER_PAD_RATIO", "0.15"))    # 0.10–0.30
+CONF_THRESH = float(os.environ.get("FER_CONF_THRESH", "0.30"))  # confidence
+BUF_LEN     = int(os.environ.get("FER_BUFFER", "10"))           # bufor
+MIN_FACE    = int(os.environ.get("FER_MIN_FACE", "100"))        
+PAD_RATIO   = float(os.environ.get("FER_PAD_RATIO", "0.15"))   
 
 SAD_TO_BORED_THRESH = float(os.environ.get("FER_SAD_TO_BORED_THRESH", "0.025"))
 NEU_MIN_FOR_BORED   = float(os.environ.get("FER_NEU_MIN_FOR_BORED", "0.55"))
 
-# Czy chcesz "zamienić sadness na boredom" (czyli w grze nie ma smutku jako osobnej klasy)?
-# 1 = sadness traktujemy jako boredom, 0 = sadness zostaje sadness
 SADNESS_AS_BOREDOM = int(os.environ.get("FER_SADNESS_AS_BOREDOM", "1")) == 1
 
-# auto: jeśli brak modelu -> mock; jeśli model jest -> onnx
+# jeśli brak modelu -> mock; jeśli model jest -> onnx
 USE_MOCK = FER_MODE == "mock" or (FER_MODE == "auto" and not os.path.exists(MODEL_PATH))
 
 # ----------------- Aplikacja -----------------
@@ -37,6 +33,7 @@ app = FastAPI(title="FER Microservice (MOCK/ONNX)", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
+# przygotowanie bazy danych
 os.makedirs("data", exist_ok=True)
 _db = sqlite3.connect(DB_PATH, check_same_thread=False)
 _db.execute("""
@@ -47,9 +44,9 @@ CREATE TABLE IF NOT EXISTS emotions (
   emotion TEXT NOT NULL,
   arousal REAL NOT NULL,
   confidence REAL NOT NULL
-)
+) 
 """)
-_db.commit()
+_db.commit() 
 
 latest_event_lock = threading.Lock()
 latest_event: Dict = {}
@@ -59,7 +56,7 @@ ws_clients: List[WebSocket] = []
 FERPLUS_LABELS = ["neutral","happiness","surprise","sadness","anger","disgust","fear","contempt"]
 IDX = {name:i for i, name in enumerate(FERPLUS_LABELS)}
 
-# Co wysyłasz do Unity:
+# Co wysyłane do Unity:
 TARGET_LABELS = ["neutral","boredom","happiness","surprise","anger","fear","sadness"]  # sadness na końcu (opcjonalnie)
 
 EMO_TO_AROUSAL = {
@@ -67,25 +64,27 @@ EMO_TO_AROUSAL = {
     "sadness":0.30, "anger":0.85, "fear":0.90
 }
 
-# Dozwolone emocje “mocne” (Twoje gameplayowe)
-ALLOWED8 = ["neutral", "happiness", "surprise", "anger", "fear", "sadness"]
 
+ALLOWED8 = ["neutral", "happiness", "surprise", "anger", "fear", "sadness"] # jedyne główne wyjścia, pomocnicze inne
+
+# nadanie ts (timestamp)
 def now_iso() -> str:
     return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
+# zapisywanie do bazy danych
 def save_evt(evt: Dict):
     _db.execute(
         "INSERT INTO emotions(ts,user,emotion,arousal,confidence) VALUES (?,?,?,?,?)",
         (evt["ts"], evt["user"], evt["emotion"], evt["arousal"], evt["confidence"])
     )
     _db.commit()
+    # blokada! 
     with latest_event_lock:
         latest_event.clear()
         latest_event.update(evt)
 
-    # TYLKO: emocja, arousal, conf
     print(f"{evt['emotion']}  conf={evt['confidence']}")
-
+# wysyłka JSON do klientów, obsługa klientów 
 async def broadcast(evt: Dict):
     dead=[]
     for ws in ws_clients:
@@ -131,7 +130,7 @@ def softmax_np(np, x):
     x = x - np.max(x)
     e = np.exp(x)
     return e / (np.sum(e) + 1e-8)
-
+# dla pewnosci modelu, 2 najwieksze, porownanie 
 def top2_allowed(mean8):
     pairs = [(name, float(mean8[IDX[name]])) for name in ALLOWED8]
     pairs.sort(key=lambda x: x[1], reverse=True)
@@ -150,12 +149,11 @@ def boredom_condition(mean8, std8, p8_inst=None):
     sad = float(mean8[IDX["sadness"]])
     con = float(mean8[IDX["contempt"]])
 
-    # neutral w miarę wysoki
+    # neutral arę wysoki
     if neu < NEU_MIN_FOR_BORED:
         return False
 
-    # klucz: musi być też trochę smutku / pogardy
-    # (neutralna twarz zwykle ma sad~0.05-0.15 i tu odpadnie)
+    #  trochę smutku / pogardy
     if (sad + 0.5*con) < 0.10:
         return False
     if sad >= SAD_TO_BORED_THRESH:
@@ -173,7 +171,7 @@ def boredom_condition(mean8, std8, p8_inst=None):
         if float(p8_inst[IDX["fear"]]) > 0.16:
             return False
 
-    # stabilność
+    # stabilność, blokowanie boredom
     low_var = float(std8.max()) < 0.030 if std8 is not None else True
     if not low_var:
         return False
@@ -213,7 +211,7 @@ async def capture_loop():
 
             emotion, base_arousal = emotions_cycle[idx]
 
-            # lekka fluktuacja arousal (żeby nie było sztywne)
+
             arousal = base_arousal + 0.05 * math.sin(now * 0.8)
             arousal = max(0.0, min(1.0, arousal))
 
@@ -222,7 +220,7 @@ async def capture_loop():
                 "user": USER_ID,
                 "emotion": emotion,
                 "arousal": round(arousal, 3),
-                "confidence": 0.95   # mock = wysoka pewność, ale NIE 1.0
+                "confidence": 0.95   
             }
 
             save_evt(evt)
@@ -271,7 +269,7 @@ async def capture_loop():
         if not ok or frame is None:
             await asyncio.sleep(0.05)
             continue
-
+        top3_8 = [("n/a", 0.0), ("n/a", 0.0), ("n/a", 0.0)]
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         faces = []
@@ -282,7 +280,7 @@ async def capture_loop():
         else:
             faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=3, minSize=(80, 80))
 
-        # brak twarzy / za mała twarz -> neutral (a nie boredom)
+        # brak twarzy / za mała twarz -> neutral 
         if len(faces) == 0:
             label, conf = "neutral", 0.0
         else:
@@ -301,7 +299,7 @@ async def capture_loop():
                 probs8_long.append(p8_inst)
 
                 mean8 = np.mean(np.stack(list(probs8_long)), axis=0)
-                std8  = np.std (np.stack(list(probs8_long)), axis=0)
+                std8  = np.std (np.stack(list(probs8_long)), axis=0) # odchylenie
 
                 # wybór etykiety (z allowed)
                 n1, p1, n2, p2 = top2_allowed(mean8)
@@ -333,16 +331,17 @@ async def capture_loop():
                 ii8 = np.argsort(mean8)[-3:][::-1]
                 top3_8 = [(FERPLUS_LABELS[i], float(mean8[i])) for i in ii8]
                 #print(f"[FER dbg] top3(8 mean): {top3_8} | picked={label} ({conf:.2f}) margin={margin:.2f}")
-                print(
-                    f"[FER] picked={label:<9} conf={conf:.2f} | arousal={arousal:.2f} | "
+                
+
+        base = EMO_TO_AROUSAL.get(label, 0.5)
+        arousal = float(max(0.0, min(1.0, 0.2*base + 0.8*(base*max(conf, 0.25)))))
+        print(
+                    f"[FER] picked={label:<9} conf={conf:.2f} | "
                     f"TOP3: "
                     f"{top3_8[0][0]}={top3_8[0][1]:.2f}, "
                     f"{top3_8[1][0]}={top3_8[1][1]:.2f}, "
                     f"{top3_8[2][0]}={top3_8[2][1]:.2f}"
                 )
-
-        base = EMO_TO_AROUSAL.get(label, 0.5)
-        arousal = float(max(0.0, min(1.0, 0.2*base + 0.8*(base*max(conf, 0.25)))))
 
         evt = {"ts": now_iso(), "user": USER_ID, "emotion": label,
                "arousal": round(arousal, 3), "confidence": round(conf, 3)}
